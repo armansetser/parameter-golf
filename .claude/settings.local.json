@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3:*)",
-      "Bash(source .venv/bin/activate)",
-      "Bash(source /Users/arman/src/parameter-golf/.venv/bin/activate)"
-    ]
-  }
-}

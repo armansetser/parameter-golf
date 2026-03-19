@@ -50,9 +50,8 @@ class Hyperparameters:
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation uses the full fineweb_val split by default; set VAL_MAX_TOKENS to cap it.
+    # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -60,6 +59,10 @@ class Hyperparameters:
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
+    # Force MLX to materialize the graph after every sub-batch, preventing lazy
+    # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
+    # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
+    mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -77,15 +80,6 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
-
-    # MoE. num_experts=1 disables MoE and uses the dense MLP.
-    # Each expert processes a disjoint slice of the input dimension (ensemble approach).
-    num_experts: int = int(os.environ.get("NUM_EXPERTS", 4))
-    moe_shared_expert: bool = bool(int(os.environ.get("MOE_SHARED_EXPERT", "1")))
-    # Pattern of A (attention) and C (conv mixer) blocks, e.g. "AACAACAAC".
-    # Empty string or "A"*num_layers = all attention (default behavior).
-    attn_pattern: str = os.environ.get("ATTN_PATTERN", "AACAACAAC")
-    conv_mixer_kernel: int = int(os.environ.get("CONV_MIXER_KERNEL", 32))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -346,69 +340,15 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, hidden: int):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
+        hidden = dim * mlp_mult
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.fc(x))
         return self.proj(x * x)
-
-
-class EnsembleMoE(nn.Module):
-    """Each expert processes a disjoint slice of the input dimension.
-    No router needed — specialization is structural. Outputs are concatenated."""
-    def __init__(self, dim: int, num_experts: int, hidden_per_expert: int, shared_expert: bool = False):
-        super().__init__()
-        if dim % num_experts != 0:
-            raise ValueError(f"model_dim ({dim}) must be divisible by num_experts ({num_experts})")
-        self.num_experts = num_experts
-        self.slice_dim = dim // num_experts
-        # Each expert: slice_dim → hidden → slice_dim, concat back to dim
-        self.experts = [MLP(self.slice_dim, hidden_per_expert) for _ in range(num_experts)]
-        self.shared_expert = MLP(dim, hidden_per_expert) if shared_expert else None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        bsz, seq_len, dim = x.shape
-        x_flat = x.reshape(-1, dim)
-        parts = []
-        for i in range(self.num_experts):
-            slice_i = x_flat[:, i * self.slice_dim:(i + 1) * self.slice_dim]
-            parts.append(self.experts[i](slice_i))  # (B*T, slice_dim)
-        out = mx.concatenate(parts, axis=-1)  # (B*T, dim)
-        if self.shared_expert is not None:
-            out = out + self.shared_expert(x_flat)
-        return out.reshape(bsz, seq_len, dim)
-
-
-class CausalDepthwiseConv1D(nn.Module):
-    """Causal depthwise 1D convolution over the sequence dimension.
-    Left-pads by (kernel_size - 1) so each position only sees past + current."""
-    def __init__(self, dim: int, kernel_size: int = 4):
-        super().__init__()
-        self.kernel_size = kernel_size
-        # Weight shape: (dim, kernel_size, 1) — MLX conv_general layout (out, K, in/groups)
-        self.weight = mx.random.normal((dim, kernel_size, 1), dtype=mx.float32) * (kernel_size ** -0.5)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        # x: (B, T, D) → conv1d expects (B, T, D) with weight (D, 1, K) for groups=D
-        pad = self.kernel_size - 1
-        x_padded = mx.pad(x, [(0, 0), (pad, 0), (0, 0)])  # left-pad sequence dim
-        return mx.conv_general(x_padded, self.weight.astype(x.dtype), groups=x.shape[-1])
-
-
-class CausalConvMixer(nn.Module):
-    """Gated causal convolution as a drop-in replacement for attention.
-    Structure: depthwise_causal_conv → linear_proj.
-    Much cheaper than attention — no Q/K/V projections, just conv + output proj."""
-    def __init__(self, dim: int, kernel_size: int = 32):
-        super().__init__()
-        self.conv = CausalDepthwiseConv1D(dim, kernel_size=kernel_size)
-        self.proj = CastedLinear(dim, dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.proj(nn.silu(self.conv(x)))
 
 
 class Block(nn.Module):
@@ -420,24 +360,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        num_experts: int = 1,
-        moe_shared_expert: bool = False,
-        use_conv_mixer: bool = False,
-        conv_mixer_kernel: int = 32,
     ):
         super().__init__()
-        self.use_conv_mixer = use_conv_mixer
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        if use_conv_mixer:
-            self.seq_mixer = CausalConvMixer(dim, kernel_size=conv_mixer_kernel)
-        else:
-            self.seq_mixer = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        hidden = dim * mlp_mult
-        if num_experts > 1:
-            self.mlp = EnsembleMoE(dim, num_experts, hidden, shared_expert=moe_shared_expert)
-        else:
-            self.mlp = MLP(dim, hidden)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -445,8 +373,8 @@ class Block(nn.Module):
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        seq_out = self.seq_mixer(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * seq_out
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -458,19 +386,12 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, num_experts: int = 1, moe_shared_expert: bool = False,
-                 attn_pattern: str = "", conv_mixer_kernel: int = 32):
+                 qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-
-        # Parse attention pattern: "A"=attention, "C"=conv mixer. Default = all attention.
-        if not attn_pattern:
-            attn_pattern = "A" * num_layers
-        if len(attn_pattern) != num_layers:
-            raise ValueError(f"attn_pattern length ({len(attn_pattern)}) must match num_layers ({num_layers})")
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -478,24 +399,14 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  num_experts=num_experts, moe_shared_expert=moe_shared_expert,
-                  use_conv_mixer=(attn_pattern[i].upper() == "C"),
-                  conv_mixer_kernel=conv_mixer_kernel)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
-            # Zero-init output projections
-            b.seq_mixer.proj.weight = mx.zeros_like(b.seq_mixer.proj.weight)
-            if num_experts > 1:
-                for expert in b.mlp.experts:
-                    expert.proj.weight = mx.zeros_like(expert.proj.weight)
-                if b.mlp.shared_expert is not None:
-                    b.mlp.shared_expert.proj.weight = mx.zeros_like(b.mlp.shared_expert.proj.weight)
-            else:
-                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -842,6 +753,8 @@ def loss_and_grad_chunked(
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
+        if args.mlx_eager_eval:
+            mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
     return loss_value, tree_unflatten(list(grad_accum.items()))
 
 
@@ -857,17 +770,15 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    val_batch_tokens = args.val_batch_size
+    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
     if val_batch_tokens < args.train_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
             f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    if args.val_max_tokens > 0:
-        total_seqs = min(total_seqs, max(args.val_max_tokens // args.train_seq_len, 1))
     total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
     total_loss_sum = 0.0
     total_tokens = 0.0
@@ -986,10 +897,6 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
-        num_experts=args.num_experts,
-        moe_shared_expert=args.moe_shared_expert,
-        attn_pattern=args.attn_pattern,
-        conv_mixer_kernel=args.conv_mixer_kernel,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1046,7 +953,7 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].seq_mixer.proj.weight.dtype} "
+        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
@@ -1071,11 +978,11 @@ def main() -> None:
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
         # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
-        val_batch_tokens = args.val_batch_size
+        val_batch_tokens = args.val_batch_size // args.grad_accum_steps
         if val_batch_tokens < args.train_seq_len:
             raise ValueError(
                 "VAL_BATCH_SIZE must provide at least one sequence; "
-                f"got VAL_BATCH_SIZE={args.val_batch_size}, "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
                 f"TRAIN_SEQ_LEN={args.train_seq_len}"
             )
         warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
@@ -1128,6 +1035,8 @@ def main() -> None:
             loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+            if args.mlx_eager_eval:
+                mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
